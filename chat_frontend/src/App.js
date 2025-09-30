@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { format } from "date-fns";
 import { v4 as uuidv4 } from "uuid";
+import api, { ApiClient } from "./services/api";
+import SocketClient from "./services/socket";
 
 /**
  * Theme and utility
@@ -30,7 +32,8 @@ export function applyThemeVars(theme = OceanTheme) {
 }
 
 /**
- * Mock API and WebSocket services
+ * Local mocks (fallback) - retained for developer convenience when no backend is configured.
+ * If REACT_APP_API_URL/REACT_APP_WS_URL are provided, the app will use real clients.
  */
 const createMockRooms = () => ([
   { id: "general", name: "General", unread: 2 },
@@ -61,31 +64,21 @@ const mockMessageStore = {
   random: []
 };
 
-/**
- * Mock REST client - can be swapped with real endpoints.
- */
+// Fallback mock REST when no API base url provided
 const MockRest = {
-  // PUBLIC_INTERFACE
   async listRooms() {
-    /** Returns available chat rooms. */
     await sleep(200);
     return createMockRooms();
   },
-  // PUBLIC_INTERFACE
   async listUsers() {
-    /** Returns online users. */
     await sleep(200);
     return createMockUsers();
   },
-  // PUBLIC_INTERFACE
   async getMessages(roomId) {
-    /** Returns existing messages in a room. */
     await sleep(150);
     return (mockMessageStore[roomId] || []).slice(-200);
   },
-  // PUBLIC_INTERFACE
   async sendMessage(roomId, content) {
-    /** Sends a message into a room and returns saved message. */
     await sleep(120);
     const msg = { id: uuidv4(), roomId, author: "You", me: true, content, ts: new Date() };
     mockMessageStore[roomId] = [...(mockMessageStore[roomId] || []), msg];
@@ -93,45 +86,40 @@ const MockRest = {
   }
 };
 
-/**
- * Mock WebSocket client - emits fake incoming messages periodically.
- * Replace with a real WS connection (e.g., new WebSocket(process.env.REACT_APP_WS_URL))
- */
+// Fallback mock socket for local demo
 class MockSocket {
   constructor(onMessage) {
     this.onMessage = onMessage;
     this._interval = null;
   }
-  // PUBLIC_INTERFACE
   connect() {
-    /** Connects to the mock stream and starts sending demo messages. */
     this._interval = setInterval(() => {
       const rooms = Object.keys(mockMessageStore);
-      const roomId = rooms[Math.floor(Math.random()*rooms.length)];
-      const names = ["Ava","Noah","Mia","Liam"];
-      const author = names[Math.floor(Math.random()*names.length)];
+      const roomId = rooms[Math.floor(Math.random() * rooms.length)];
+      const names = ["Ava", "Noah", "Mia", "Liam"];
+      const author = names[Math.floor(Math.random() * names.length)];
       const contentChoices = [
         "This looks great!",
         "Ocean vibes 🌊",
         "Let's deploy later today.",
         "Ping me if you need help.",
-        "Working on the UI polish."
+        "Working on the UI polish.",
       ];
-      const content = contentChoices[Math.floor(Math.random()*contentChoices.length)];
-      const msg = { id: uuidv4(), roomId, author, me:false, content, ts: new Date() };
+      const content = contentChoices[Math.floor(Math.random() * contentChoices.length)];
+      const msg = { id: uuidv4(), roomId, author, me: false, content, ts: new Date() };
       mockMessageStore[roomId] = [...(mockMessageStore[roomId] || []), msg];
       this.onMessage?.(msg);
     }, 6500);
   }
-  // PUBLIC_INTERFACE
   disconnect() {
-    /** Disconnects the mock stream. */
     if (this._interval) clearInterval(this._interval);
   }
 }
 
 /** helpers */
-function sleep(ms){ return new Promise(res => setTimeout(res, ms)); }
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
 
 /**
  * UI Components
@@ -335,7 +323,12 @@ function ChatPane({ room, messages, onSendMessage }) {
   );
 }
 
-// PUBLIC_INTERFACE
+/**
+ * Decide which transport to use based on env:
+ * - If REACT_APP_API_URL is set, use real ApiClient (backend should proxy to Playwright MCP).
+ * - If REACT_APP_WS_URL is set, use real SocketClient for realtime updates (backend proxies MCP events).
+ * - Otherwise, fall back to in-memory mocks for local demo.
+ */
 function App() {
   /** Root app composing header, sidebar, and chat pane. */
   const [rooms, setRooms] = useState([]);
@@ -344,45 +337,108 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [socket, setSocket] = useState(null);
 
+  const isRealApi =
+    typeof process !== "undefined" &&
+    process.env &&
+    !!process.env.REACT_APP_API_URL;
+
+  const isRealWs =
+    typeof process !== "undefined" &&
+    process.env &&
+    !!process.env.REACT_APP_WS_URL;
+
+  // Select the API client instance
+  const apiClient = useMemo(() => {
+    if (isRealApi) {
+      // In real deployments, the backend should expose endpoints that translate to
+      // Playwright MCP operations (e.g., list rooms/sessions, fetch/send messages).
+      return api;
+    }
+    // Fallback to mock for local dev without backend
+    return {
+      listRooms: MockRest.listRooms,
+      listUsers: MockRest.listUsers,
+      getMessages: MockRest.getMessages,
+      sendMessage: MockRest.sendMessage,
+    };
+  }, [isRealApi]);
+
   useEffect(() => {
     applyThemeVars(OceanTheme);
   }, []);
 
   useEffect(() => {
     // initial data load
-    (async ()=> {
-      const [r, u] = await Promise.all([MockRest.listRooms(), MockRest.listUsers()]);
-      setRooms(r);
-      setUsers(u);
+    (async () => {
+      try {
+        const [r, u] = await Promise.all([apiClient.listRooms(), apiClient.listUsers()]);
+        setRooms(Array.isArray(r) ? r : []);
+        setUsers(Array.isArray(u) ? u : []);
+      } catch (e) {
+        console.error("Failed to load initial data:", e);
+        // Ensure UI still renders
+        setRooms([]);
+        setUsers([]);
+      }
     })();
-  }, []);
+  }, [apiClient]);
 
   useEffect(() => {
     // load room messages
     if (!activeRoomId) return;
     (async () => {
-      const msgs = await MockRest.getMessages(activeRoomId);
-      setMessages(msgs);
+      try {
+        const msgs = await apiClient.getMessages(activeRoomId);
+        setMessages(Array.isArray(msgs) ? msgs : []);
+      } catch (e) {
+        console.error("Failed to load messages:", e);
+        setMessages([]);
+      }
     })();
-  }, [activeRoomId]);
+  }, [activeRoomId, apiClient]);
 
   useEffect(() => {
-    // connect mock socket
-    const s = new MockSocket((incoming) => {
+    // Connect to real socket if configured, else use mock socket
+    const handleIncoming = (incoming) => {
+      if (!incoming) return;
+      // Expected shape from backend: { id, roomId, author, me?, content, ts }
       if (incoming.roomId === activeRoomId) {
-        setMessages(prev => [...prev, incoming]);
+        setMessages((prev) => [...prev, { ...incoming, ts: incoming.ts ? incoming.ts : new Date() }]);
       }
-    });
-    s.connect();
-    setSocket(s);
-    return () => s.disconnect();
-  }, [activeRoomId]);
+    };
 
-  const activeRoom = useMemo(() => rooms.find(r => r.id === activeRoomId), [rooms, activeRoomId]);
+    let s;
+    if (isRealWs) {
+      // Real socket: backend should forward MCP streaming events as messages
+      s = new SocketClient({
+        onMessage: handleIncoming,
+      });
+      s.connect();
+    } else {
+      // Mock socket: local periodic demo messages
+      s = new MockSocket(handleIncoming);
+      s.connect();
+    }
+    setSocket(s);
+    return () => s && s.disconnect();
+  }, [activeRoomId, isRealWs]);
+
+  const activeRoom = useMemo(
+    () => rooms.find((r) => r.id === activeRoomId),
+    [rooms, activeRoomId]
+  );
 
   const handleSend = async (text) => {
-    const saved = await MockRest.sendMessage(activeRoomId, text);
-    setMessages(prev => [...prev, saved]);
+    try {
+      // In real mode, this POST goes to backend, which sends to MCP
+      const saved = await apiClient.sendMessage(activeRoomId, text);
+      setMessages((prev) => [...prev, saved]);
+      // Optionally, also emit over WS if your backend expects client->WS (depends on your design)
+      // socket?.send({ type: "message", roomId: activeRoomId, content: text });
+    } catch (e) {
+      console.error("Failed to send:", e);
+      alert("Failed to send message. Check console.");
+    }
   };
 
   return (
